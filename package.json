@@ -1,0 +1,10 @@
+{
+  "name": "ba-work-tracker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "BA Workbench - Capacity & Sequencing tracker, self-hosted on Vercel with Upstash Redis storage.",
+  "dependencies": {
+    "@upstash/redis": "^1.34.0"
+  }
+}
