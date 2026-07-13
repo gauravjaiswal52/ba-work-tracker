@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -505,6 +506,16 @@
       return Object.assign({}, t, { duration, daysRemaining, inWindow, weight, open, dataComplete, visible, active });
     });
 
+    // Hours already completed this sprint per BA - these stay "used" against
+    // capacity, so completing a task doesn't shrink the cumulative total that
+    // "Fits in Capacity Now?" and Cum. hrs are measured against.
+    const completedHoursByBA = {};
+    enriched.forEach(t => {
+      if (t.status === 'Completed' && t.completedDate && t.completedDate >= windowStart) {
+        completedHoursByBA[t.ba] = (completedHoursByBA[t.ba] || 0) + (Number(t.hours) || 0);
+      }
+    });
+
     // group active (approved, open) tasks by BA, sort by priority weight -> estEnd -> dateRequested -> id
     const byBA = {};
     enriched.forEach(t => { if (!t.active) return; (byBA[t.ba] = byBA[t.ba] || []).push(t); });
@@ -517,7 +528,7 @@
         if (ra !== rb) return ra < rb ? -1 : 1;
         return a.id - b.id;
       });
-      let cum = 0;
+      let cum = completedHoursByBA[ba] || 0; // start from hours already used this sprint, not zero
       byBA[ba].forEach((t, idx) => {
         t.pickupOrder = idx + 1;
         cum += Number(t.hours) || 0;
@@ -542,20 +553,47 @@
     return { enriched, windowStart, windowEnd, today };
   }
 
-  function computeBAAvailability(enriched){
+  function workingDaysRemaining(windowStart, windowEnd, today){
+    const start = today > windowStart ? today : windowStart;
+    let count = 0;
+    const d = new Date(start + 'T00:00:00');
+    const end = new Date(windowEnd + 'T00:00:00');
+    while (d <= end) {
+      const day = d.getDay();
+      if (day !== 0 && day !== 6) count++;
+      d.setDate(d.getDate() + 1);
+    }
+    return count;
+  }
+
+  function computeBAAvailability(enriched, windowStart, windowEnd, today){
+    const daysLeft = workingDaysRemaining(windowStart, windowEnd, today);
     return state.bas.map(ba => {
       const open = enriched.filter(t => t.ba === ba.name && t.active);
       const committed = open.reduce((s,t) => s + (Number(t.hours)||0), 0);
+
+      // Hours completed THIS sprint still count as "used" - completing a task
+      // moves its hours from committed-to-open into completed-this-sprint, but
+      // never removes them from the sprint's total, so Remaining never jumps.
+      const completedThisSprint = enriched.filter(t =>
+        t.ba === ba.name && t.status === 'Completed' && t.completedDate && t.completedDate >= windowStart);
+      const completedHours = completedThisSprint.reduce((s,t) => s + (Number(t.hours)||0), 0);
+
       const cap2w = ba.weeklyCapacity * 2;
-      const remaining = cap2w - committed;
-      const util = cap2w > 0 ? committed / cap2w : 0;
+      const totalUsed = committed + completedHours;
+      const remaining = cap2w - totalUsed; // budget-based, stable across completions
+      const dailyCapacity = ba.weeklyCapacity / 5;
+      const proratedCapacity = dailyCapacity * daysLeft; // what's realistically doable in days left
+      const realisticRemaining = Math.min(remaining, proratedCapacity); // the tighter of the two constraints
+      const util = cap2w > 0 ? totalUsed / cap2w : 0;
       const risk = open.filter(t => t.status === 'At Risk' || t.status === 'Blocked').length;
       const p1p2 = open.filter(t => t.priority === 'P1' || t.priority === 'P2').reduce((s,t)=>s+(Number(t.hours)||0),0);
       let status = 'Available';
       if (risk > 0) status = 'Needs attention';
       else if (remaining <= 0) status = 'Overloaded';
+      else if (realisticRemaining <= 0) status = 'Sprint ending'; // budget is fine, but no working days left to use it
       const nextUp = open.find(t => t.pickupOrder === 1) || null;
-      return { name: ba.name, weeklyCapacity: ba.weeklyCapacity, cap2w, committed, remaining, util, risk, p1p2, status, nextUp, openCount: open.length };
+      return { name: ba.name, weeklyCapacity: ba.weeklyCapacity, cap2w, committed, completedHours, totalUsed, remaining, realisticRemaining, daysLeft, util, risk, p1p2, status, nextUp, openCount: open.length };
     });
   }
 
@@ -1273,21 +1311,21 @@
   }
 
   function renderAvailability(){
-    const { enriched } = computeDerived();
-    const avail = computeBAAvailability(enriched);
+    const { enriched, windowStart, windowEnd, today } = computeDerived();
+    const avail = computeBAAvailability(enriched, windowStart, windowEnd, today);
     const waitingUnassigned = enriched.filter(t=>t.active && t.ba==='Unassigned');
     const waitingHours = waitingUnassigned.reduce((s,t)=>s+(Number(t.hours)||0),0);
 
     root.innerHTML = `
       <div class="pagehead">
         <h1>BA Availability</h1>
-        <p>Committed hours vs. 2-week capacity for each BA, plus the single task they should pick up next.</p>
+        <p>Committed hours vs. 2-week capacity for each BA, capped by working days actually left in this sprint, plus the single task they should pick up next.</p>
       </div>
       <div class="statrow">
         <div class="statcard"><div class="n mono">${waitingUnassigned.length}</div><div class="l">Unassigned requests waiting</div></div>
         <div class="statcard"><div class="n mono">${waitingHours}</div><div class="l">Unassigned hours waiting</div></div>
         <div class="statcard"><div class="n mono">${avail.filter(a=>a.status==='Available').length}</div><div class="l">BAs with headroom</div></div>
-        <div class="statcard"><div class="n mono">${avail.filter(a=>a.status!=='Available').length}</div><div class="l">BAs overloaded / at risk</div></div>
+        <div class="statcard"><div class="n mono">${avail.filter(a=>a.status!=='Available').length}</div><div class="l">BAs without headroom</div></div>
       </div>
       <div class="card">
         <div class="legend-key">
@@ -1305,10 +1343,20 @@
     const pct = a.cap2w > 0 ? Math.min(a.util, 1.3) : 0;
     const fillPct = Math.min(pct, 1) * 100;
     const overflow = a.util > 1;
-    const statusCls = a.status === 'Available' ? 'pill-yes' : (a.status === 'Needs attention' ? 'pill-atrisk' : 'pill-no');
+    const statusCls = a.status === 'Available' ? 'pill-yes' : (a.status === 'Sprint ending' ? 'pill-atrisk' : 'pill-no');
     const nextUpHtml = a.nextUp
       ? `<div class="bacard-nextup"><span class="lbl">Next up (pick-up order 1)</span>${escapeHtml(a.nextUp.task)} <span class="mono" style="color:var(--ink-soft);">— ${a.nextUp.hours} hrs, ${a.nextUp.priority}, due ${fmtDate(a.nextUp.estEnd)}</span></div>`
       : `<div class="bacard-nextup"><span class="lbl">Next up</span>Nothing queued — fully clear.</div>`;
+    const remainingLabel = a.realisticRemaining >= 0
+      ? `${Math.round(a.realisticRemaining*10)/10} hrs realistically left this sprint`
+      : `${Math.round(Math.abs(a.realisticRemaining)*10)/10} hrs over`;
+    const budgetDiffers = Math.round(a.remaining*10) !== Math.round(a.realisticRemaining*10);
+    const budgetNote = budgetDiffers
+      ? ` <span style="color:var(--ink-faint);" title="Total budget left if no more calendar time existed this sprint, before accounting for how many working days are actually left">(${a.remaining} hrs budget)</span>`
+      : '';
+    const usedBreakdown = a.completedHours > 0
+      ? `${a.committed} hrs still open + ${a.completedHours} hrs completed this sprint`
+      : `${a.committed} hrs open`;
     return `
       <div class="bacard">
         <div class="bacard-top">
@@ -1321,8 +1369,11 @@
             ${overflow ? '<div class="overmark"></div>' : ''}
           </div>
           <div class="capline">
-            <span>${a.committed} / ${a.cap2w} hrs committed (${Math.round(a.util*100)}%)</span>
-            <span>${a.remaining >= 0 ? a.remaining + ' hrs remaining' : Math.abs(a.remaining) + ' hrs over'}</span>
+            <span title="${usedBreakdown}">${a.totalUsed} / ${a.cap2w} hrs used this sprint (${Math.round(a.util*100)}%)</span>
+            <span>${remainingLabel}${budgetNote}</span>
+          </div>
+          <div class="capline" style="margin-top:2px;">
+            <span style="color:var(--ink-faint);">${usedBreakdown} · ${a.daysLeft} working day${a.daysLeft===1?'':'s'} left</span>
           </div>
         </div>
         ${nextUpHtml}
@@ -1641,6 +1692,11 @@
             <li><b>Date requested</b> — if still tied, first-come-first-served.</li>
           </ol>
           <p>"Cumulative hours" adds up Est. Man-Hours in that order, so you can see exactly where the line falls between "fits now" and "queued" given the BA's 2-week capacity.</p>
+        </div>
+        <div class="readme-section">
+          <h3>How BA Availability's "hrs used this sprint" works</h3>
+          <p>Completing a task does <b>not</b> free up hours for the rest of the sprint. Each BA's "hrs used this sprint" is the sum of hours still open <i>plus</i> hours already completed this sprint \u2014 so marking a task Completed just moves its hours from "still open" to "completed," without changing the total. The breakdown line under the bar (e.g., "28 hrs still open + 6 hrs completed this sprint") always shows both pieces, so it's clear where the hours sit without the top-line number ever jumping around.</p>
+          <p>"Hrs realistically left this sprint" takes that stable total and additionally caps it by how many working days are actually left in the current Monday\u2013Friday window \u2014 it will never show more than what a BA could physically get through in the days remaining. If the uncapped budget figure differs from this (i.e., the sprint is nearly over), it's shown alongside in parentheses for context. Together, these two changes mean the numbers only move when something genuinely changes a BA's future workload \u2014 a new request, a priority change, or the sprint rolling over \u2014 never just because a task got marked done.</p>
         </div>
         <div class="readme-section">
           <h3>Priority legend</h3>
