@@ -311,7 +311,7 @@
       mkTask(9,'Shravani','Kshitiz','Vendor Integration API','Blocked — awaiting vendor API credentials',8,'P1','Blocked',plusDays(-6),plusDays(-3),plusDays(5),'Vendor delay'),
       mkTask(10,'Mannat','Unassigned','New Fraud Rules Engine','Write acceptance criteria for integration test suite',15,'P4','New Request',plusDays(0),plusDays(9),plusDays(13),'Needs a BA allocated'),
     ];
-    return { pms, bas, tasks, nextId: 11, approverName: 'Nimish', activityLog: [] };
+    return { pms, bas, tasks, nextId: 11, approverName: 'Nimish', activityLog: [], approvalCode: '' };
   }
 
   function mkTask(id,pm,ba,project,task,hours,priority,status,dateRequested,targetStart,estEnd,notes,projectEDD){
@@ -380,6 +380,7 @@
   }
 
   let loadedVersion = 0;
+  let loadFailed = false; // safety flag: true if we couldn't confirm what's really saved - blocks saves until a successful reload
 
   async function loadState(){
     try {
@@ -391,17 +392,37 @@
           if (!state.approverName) state.approverName = 'Nimish';
           if (!Array.isArray(state.tasks)) state.tasks = [];
           if (!Array.isArray(state.activityLog)) state.activityLog = [];
+          if (state.approvalCode === undefined) state.approvalCode = '';
           loadedVersion = state.__version || 0;
+          loadFailed = false;
           return;
         }
+        // res.ok but no data at all - genuinely nothing saved yet, safe to seed defaults
+        state = defaultState();
+        loadedVersion = 0;
+        loadFailed = false;
+        await saveState();
+        return;
       }
-    } catch(e) { /* server not reachable yet, or nothing saved yet */ }
-    state = defaultState();
-    loadedVersion = 0;
-    await saveState();
+      // Server reachable but returned an error - do NOT touch/overwrite whatever is actually saved
+      loadFailed = true;
+      state = defaultState();
+      showToast('Could not load the latest data from the server (error ' + res.status + '). Please refresh before making any changes - nothing has been overwritten.');
+      return;
+    } catch(e) {
+      // Network/connection failure - do NOT touch/overwrite whatever is actually saved
+      loadFailed = true;
+      state = defaultState();
+      showToast('Could not reach the server to load data. Please check your connection and refresh before making any changes - nothing has been overwritten.');
+      console.error('loadState error:', e);
+    }
   }
 
   async function saveState(){
+    if (loadFailed) {
+      showToast('Could not confirm the latest saved data, so nothing was saved. Please refresh the page and try again.');
+      return false;
+    }
     try {
       const payload = Object.assign({}, state, { __expectedVersion: loadedVersion });
       const res = await fetch('/api/state', {
@@ -410,7 +431,7 @@
         body: JSON.stringify(payload),
       });
       if (res.status === 409) {
-        showToast('Someone else saved changes just now — reloading the latest data. Please redo your last change.');
+        showToast('Someone else saved changes just now. If a form is open, everything you typed is still there — just click Save again.');
         await loadState();
         render();
         return false;
@@ -1252,6 +1273,7 @@
       <div class="approval-actions">
         <label>Approved by</label>
         <input type="text" id="approver-new-${t.id}" value="${escapeHtml(state.approverName)}"/>
+        ${state.approvalCode ? `<label>Code</label><input type="password" id="code-new-${t.id}" style="max-width:100px;"/>` : ''}
         <button class="btn btn-primary btn-sm" data-approve-new="${t.id}">Approve</button>
         <button class="btn btn-danger btn-sm" data-reject-new="${t.id}">Reject</button>
       </div>
@@ -1278,6 +1300,7 @@
       <div class="approval-actions">
         <label>Approved by</label>
         <input type="text" id="approver-edit-${t.id}" value="${escapeHtml(state.approverName)}"/>
+        ${state.approvalCode ? `<label>Code</label><input type="password" id="code-edit-${t.id}" style="max-width:100px;"/>` : ''}
         <button class="btn btn-primary btn-sm" data-approve-edit="${t.id}">Approve</button>
         <button class="btn btn-danger btn-sm" data-reject-edit="${t.id}">Reject</button>
       </div>
@@ -1287,6 +1310,13 @@
   async function approveNewRequest(id){
     const idx = state.tasks.findIndex(t => t.id === id);
     if (idx === -1) return;
+    if (state.approvalCode) {
+      const enteredCode = (document.getElementById(`code-new-${id}`)||{}).value || '';
+      if (enteredCode !== state.approvalCode) {
+        showToast('Incorrect approval code \u2014 not approved.');
+        return;
+      }
+    }
     const by = (document.getElementById(`approver-new-${id}`)||{}).value || state.approverName;
     state.tasks[idx].awaitingApproval = false;
     state.tasks[idx].lastApproval = { by, at: new Date().toISOString(), action: 'approved-new' };
@@ -1310,6 +1340,13 @@
   async function approveEdit(id){
     const idx = state.tasks.findIndex(t => t.id === id);
     if (idx === -1) return;
+    if (state.approvalCode) {
+      const enteredCode = (document.getElementById(`code-edit-${id}`)||{}).value || '';
+      if (enteredCode !== state.approvalCode) {
+        showToast('Incorrect approval code \u2014 not approved.');
+        return;
+      }
+    }
     const by = (document.getElementById(`approver-edit-${id}`)||{}).value || state.approverName;
     const pc = state.tasks[idx].pendingChange;
     const detail = GATED_FIELDS.filter(f => pc[f] !== undefined).map(f => `${FIELD_LABELS[f]} \u2192 ${pc[f]}`).join('; ');
@@ -1577,6 +1614,11 @@
         <div class="filters">
           <select id="approver-select">${state.pms.map(p=>`<option ${p===state.approverName?'selected':''}>${escapeHtml(p)}</option>`).join('')}</select>
         </div>
+        <div class="sub" style="margin-top:14px;">Optional approval code \u2014 if set, ${escapeHtml(state.approverName)} must enter it to approve anything. Leave blank to turn this off. Since there's no login system, treat this as a light deterrent against casual clicks, not real security \u2014 anyone who can view this page's data could see it with enough technical effort.</div>
+        <div class="filters">
+          <input type="password" id="approval-code-input" placeholder="No code set" value="${escapeHtml(state.approvalCode||'')}" style="max-width:180px;"/>
+          <button class="btn btn-ghost btn-sm" id="toggle-code-visibility">Show</button>
+        </div>
       </div>
       <div class="card">
         <h2>EM/PMs (${state.pms.length})</h2>
@@ -1595,6 +1637,17 @@
       if (!(await saveState())) return;
       showToast('Approver updated.');
       render();
+    };
+    document.getElementById('approval-code-input').onchange = async (e) => {
+      state.approvalCode = e.target.value.trim();
+      if (!(await saveState())) return;
+      showToast(state.approvalCode ? 'Approval code set.' : 'Approval code removed \u2014 approvals no longer require a code.');
+    };
+    document.getElementById('toggle-code-visibility').onclick = (e) => {
+      const input = document.getElementById('approval-code-input');
+      const isPassword = input.type === 'password';
+      input.type = isPassword ? 'text' : 'password';
+      e.target.textContent = isPassword ? 'Hide' : 'Show';
     };
     const pmList = document.getElementById('pm-list');
     state.pms.forEach((pm, i) => {
@@ -1711,7 +1764,8 @@
           <p><b>Friday, Saturday, and Sunday are the open planning window.</b> New requests and any change to Priority, Target Start, Est. End, Hours, or the assigned BA go live immediately if made on any of those three days.</p>
           <p>On any other day, those same changes are held as <b>pending</b> instead of taking effect \u2014 they don't count toward a BA's capacity or pick-up order until approved. Status updates and notes are never gated and can be edited any day, so BAs can always log real progress.</p>
           <p>Right now, <b>${state.approverName}</b> is the designated approver (set on the Manage EM/PMs &amp; BAs tab). Pending items show up on the <b>Approvals</b> tab with an "Approved by" field, Approve, and Reject actions. If ${state.approverName} is the one submitting a request or edit, or a change is made Friday through Sunday, it skips the approval queue entirely.</p>
-          <p style="color:var(--ink-soft);font-size:11.5px;">Note: this link has no logins, so this is an honor-system control, not enforced access restriction \u2014 anyone with the link could technically click Approve. The EM/PM field on each submission is self-declared.</p>
+          <p>An optional <b>approval code</b> can be set on the Manage EM/PMs &amp; BAs tab. If one is set, a Code field appears on every Approve action, and the click is blocked with an "Incorrect approval code" message unless the right code is entered \u2014 Reject doesn't need it, since rejecting only discards a request rather than granting anything. Leave the code blank to turn this off entirely.</p>
+          <p style="color:var(--ink-soft);font-size:11.5px;">Note: this link has no logins, so both the approver identity and the approval code are honor-system controls, not enforced access restriction \u2014 anyone with the link could technically view the code in the page's data with enough technical effort. Treat it as a deterrent against casual clicks, not real security. The EM/PM field on each submission is self-declared too.</p>
         </div>
         <div class="readme-section">
           <h3>Activity Log</h3>
@@ -1720,7 +1774,7 @@
         </div>
         <div class="readme-section">
           <h3>If you see "Someone else saved changes..."</h3>
-          <p>This tool is shared live by everyone on the team, so it's possible for two people to be editing at the same moment. If your save shows this message, it means someone else's change reached the shared data a moment before yours \u2014 rather than silently overwriting their work, your save is stopped and the page reloads the latest data automatically. Just redo whatever you were doing and save again; nothing is lost on your end, and nobody else's work gets erased either.</p>
+          <p>This tool is shared live by everyone on the team, so it's possible for two people to be editing at the same moment. If your save shows this message, it means someone else's change reached the shared data a moment before yours \u2014 rather than silently overwriting their work, your save is stopped and the page reloads the latest data automatically. If you were in the Add/Edit form, it stays open with everything you typed still there \u2014 just click <b>Save</b> again and it will go through. Nothing you typed is lost, and nobody else's work gets erased either.</p>
         </div>
         <div class="readme-section">
           <h3>How the pick-up order is decided</h3>
