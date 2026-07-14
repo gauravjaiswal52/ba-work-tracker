@@ -1,14 +1,5 @@
 
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<title>BA Workbench &mdash; Capacity &amp; Sequencing</title>
-<meta name="description" content="BA work request tracker: priority sequencing, capacity by hours, and approvals."/>
-</head>
-<body>
-<style>
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1.0"/><title>BA Workbench</title></head><body><style>
 @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
 
 #ba-app, #ba-app * { box-sizing: border-box; }
@@ -388,6 +379,8 @@
     });
   }
 
+  let loadedVersion = 0;
+
   async function loadState(){
     try {
       const res = await fetch('/api/state');
@@ -398,28 +391,41 @@
           if (!state.approverName) state.approverName = 'Nimish';
           if (!Array.isArray(state.tasks)) state.tasks = [];
           if (!Array.isArray(state.activityLog)) state.activityLog = [];
+          loadedVersion = state.__version || 0;
           return;
         }
       }
     } catch(e) { /* server not reachable yet, or nothing saved yet */ }
     state = defaultState();
+    loadedVersion = 0;
     await saveState();
   }
 
   async function saveState(){
     try {
+      const payload = Object.assign({}, state, { __expectedVersion: loadedVersion });
       const res = await fetch('/api/state', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(state),
+        body: JSON.stringify(payload),
       });
+      if (res.status === 409) {
+        showToast('Someone else saved changes just now — reloading the latest data. Please redo your last change.');
+        await loadState();
+        render();
+        return false;
+      }
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
         throw new Error(body.error || ('HTTP ' + res.status));
       }
+      const result = await res.json();
+      if (result && typeof result.version === 'number') loadedVersion = result.version;
+      return true;
     } catch(e) {
       showToast('Could not save — check your connection or KV setup, then try again.');
       console.error('saveState error:', e);
+      return false;
     }
   }
 
@@ -490,6 +496,19 @@
   }
 
   // ---- Derived computation, mirrors the spreadsheet logic ----
+  function workingDaysBetween(start, end){
+    if (!start || !end || end < start) return 0;
+    let count = 0;
+    const d = new Date(start + 'T00:00:00');
+    const e = new Date(end + 'T00:00:00');
+    while (d <= e) {
+      const day = d.getDay();
+      if (day !== 0 && day !== 6) count++;
+      d.setDate(d.getDate() + 1);
+    }
+    return count;
+  }
+
   function computeDerived(){
     const today = todayISO();
     const { start: windowStart, end: windowEnd } = getPlanningWindow();
@@ -503,7 +522,23 @@
       const dataComplete = isDataComplete(t);
       const visible = open && !t.awaitingApproval;
       const active = visible && dataComplete;
-      return Object.assign({}, t, { duration, daysRemaining, inWindow, weight, open, dataComplete, visible, active });
+
+      // Only count the portion of a task's hours that actually falls within
+      // THIS sprint - a task whose dates extend beyond the window shouldn't
+      // consume its full hours against this sprint's capacity, only the
+      // working-day share that overlaps it.
+      let inSprintHours = Number(t.hours) || 0;
+      if (dataComplete && t.targetStart && t.estEnd) {
+        const totalDays = workingDaysBetween(t.targetStart, t.estEnd);
+        if (totalDays > 0) {
+          const overlapStart = t.targetStart > windowStart ? t.targetStart : windowStart;
+          const overlapEnd = t.estEnd < windowEnd ? t.estEnd : windowEnd;
+          const overlapDays = workingDaysBetween(overlapStart, overlapEnd);
+          inSprintHours = (Number(t.hours) || 0) * overlapDays / totalDays;
+        }
+      }
+
+      return Object.assign({}, t, { duration, daysRemaining, inWindow, weight, open, dataComplete, visible, active, inSprintHours });
     });
 
     // Hours already completed this sprint per BA - these stay "used" against
@@ -531,7 +566,7 @@
       let cum = completedHoursByBA[ba] || 0; // start from hours already used this sprint, not zero
       byBA[ba].forEach((t, idx) => {
         t.pickupOrder = idx + 1;
-        cum += Number(t.hours) || 0;
+        cum += t.inSprintHours;
         t.cumulativeHours = cum;
       });
     });
@@ -570,7 +605,7 @@
     const daysLeft = workingDaysRemaining(windowStart, windowEnd, today);
     return state.bas.map(ba => {
       const open = enriched.filter(t => t.ba === ba.name && t.active);
-      const committed = open.reduce((s,t) => s + (Number(t.hours)||0), 0);
+      const committed = open.reduce((s,t) => s + t.inSprintHours, 0);
 
       // Hours completed THIS sprint still count as "used" - completing a task
       // moves its hours from committed-to-open into completed-this-sprint, but
@@ -587,7 +622,7 @@
       const realisticRemaining = Math.min(remaining, proratedCapacity); // the tighter of the two constraints
       const util = cap2w > 0 ? totalUsed / cap2w : 0;
       const risk = open.filter(t => t.status === 'At Risk' || t.status === 'Blocked').length;
-      const p1p2 = open.filter(t => t.priority === 'P1' || t.priority === 'P2').reduce((s,t)=>s+(Number(t.hours)||0),0);
+      const p1p2 = open.filter(t => t.priority === 'P1' || t.priority === 'P2').reduce((s,t)=>s+t.inSprintHours,0);
       let status = 'Available';
       if (risk > 0) status = 'Needs attention';
       else if (remaining <= 0) status = 'Overloaded';
@@ -810,7 +845,7 @@
       <td class="wrap">${escapeHtml(t.project)}</td>
       <td class="mono">${fmtDate(t.projectEDD)}</td>
       <td class="wrap">${escapeHtml(t.task)}</td>
-      <td class="mono">${(t.hours===null||t.hours===''||t.hours===undefined)?'—':t.hours}</td>
+      <td class="mono">${(t.hours===null||t.hours===''||t.hours===undefined)?'—':t.hours}${(t.dataComplete && Math.round(t.inSprintHours*10)!==Math.round((Number(t.hours)||0)*10)) ? ` <span style="color:var(--ink-faint);font-size:10px;" title="This task's dates extend beyond the current sprint - only this many of its total hours count toward this sprint's capacity">(${Math.round(t.inSprintHours*10)/10} this sprint)</span>` : ''}</td>
       <td>${pillForPriority(t.priority)}</td>
       <td>${rankCell}</td>
       <td>${pillForStatus(t.status)}${t.pendingChange ? ' <span class="pill pill-newreq" title="Change awaiting approval">Edit pending</span>' : ''}${!t.dataComplete ? ' <span class="pill pill-atrisk" title="Missing Priority, Target Start, Est. End, or Hours — add these to include this task in sequencing">Incomplete</span>' : ''}</td>
@@ -933,7 +968,7 @@
         if (gate) toastMsg = `Request sent to ${state.approverName} for approval \u2014 it won't count toward capacity until approved.`;
         logActivity(newId, payload.task, gate ? 'Created (pending approval)' : 'Created', payload.pm, '');
       }
-      await saveState();
+      if (!(await saveState())) return;
       backdrop.remove();
       showToast(toastMsg);
       render();
@@ -1041,7 +1076,7 @@
       added++;
     });
 
-    await saveState();
+    if (!(await saveState())) return;
     document.getElementById('csv-file-input').value = '';
     showCsvSummary(added, skipped, skipReasons, pendingCount, incompleteCount);
     render();
@@ -1163,7 +1198,7 @@
     state.tasks[idx].status = 'In Progress';
     state.tasks[idx].completedDate = null;
     logActivity(id, state.tasks[idx].task, 'Reopened', by, '');
-    await saveState();
+    if (!(await saveState())) return;
     showToast('Request reopened \u2014 back in Tracker.');
     render();
   }
@@ -1256,7 +1291,7 @@
     state.tasks[idx].awaitingApproval = false;
     state.tasks[idx].lastApproval = { by, at: new Date().toISOString(), action: 'approved-new' };
     logActivity(id, state.tasks[idx].task, 'Approved new request', by, '');
-    await saveState();
+    if (!(await saveState())) return;
     showToast('Request approved \u2014 now live in Tracker.');
     render();
   }
@@ -1267,7 +1302,7 @@
     const task = state.tasks.find(t => t.id === id);
     state.tasks = state.tasks.filter(t => t.id !== id);
     logActivity(id, task ? task.task : '(unknown)', 'Rejected new request', by, '');
-    await saveState();
+    if (!(await saveState())) return;
     showToast('Request rejected.');
     render();
   }
@@ -1282,7 +1317,7 @@
     state.tasks[idx].pendingChange = null;
     state.tasks[idx].lastApproval = { by, at: new Date().toISOString(), action: 'approved-edit' };
     logActivity(id, state.tasks[idx].task, 'Approved edit', by, detail);
-    await saveState();
+    if (!(await saveState())) return;
     showToast('Change approved and applied.');
     render();
   }
@@ -1294,7 +1329,7 @@
     if (idx === -1) return;
     logActivity(id, state.tasks[idx].task, 'Rejected edit', by, '');
     state.tasks[idx].pendingChange = null;
-    await saveState();
+    if (!(await saveState())) return;
     showToast('Change rejected \u2014 original values kept.');
     render();
   }
@@ -1305,7 +1340,7 @@
     const by = (await promptModal('Delete request', 'Who is deleting this? (optional)', '')) || '(unspecified)';
     state.tasks = state.tasks.filter(t => t.id !== id);
     logActivity(id, task ? task.task : '(unknown)', 'Deleted', by, '');
-    await saveState();
+    if (!(await saveState())) return;
     showToast('Request removed.');
     render();
   }
@@ -1387,7 +1422,7 @@
     const baRows = [...state.bas.map(b=>b.name), 'Unassigned'].map(name => {
       const rows = open.filter(t => t.ba === name);
       const byPri = {P1:0,P2:0,P3:0,P4:0};
-      rows.forEach(t => { if (byPri[t.priority] != null) byPri[t.priority] += Number(t.hours)||0; });
+      rows.forEach(t => { if (byPri[t.priority] != null) byPri[t.priority] += t.inSprintHours; });
       const total = byPri.P1+byPri.P2+byPri.P3+byPri.P4;
       const risk = rows.filter(t=>t.status==='At Risk'||t.status==='Blocked').length;
       return { name, ...byPri, total, risk };
@@ -1397,7 +1432,7 @@
 
     const pmRows = state.pms.map(pm => {
       const rows = open.filter(t => t.pm === pm);
-      const hours = rows.reduce((s,t)=>s+(Number(t.hours)||0),0);
+      const hours = rows.reduce((s,t)=>s+t.inSprintHours,0);
       const unassigned = rows.filter(t=>t.ba==='Unassigned').length;
       const newReq = rows.filter(t=>t.status==='New Request').length;
       return { pm, count: rows.length, hours, unassigned, newReq };
@@ -1411,7 +1446,7 @@
         <p>Open workload across all BAs and all 13 EM/PMs, at a glance.</p>
       </div>
       <div class="card">
-        <h2>Open hours by BA and priority</h2>
+        <h2>Open hours by BA and priority (this sprint)</h2>
         <div class="tablewrap">
           <table>
             <thead><tr><th>Business Analyst</th><th>Load</th><th>P1</th><th>P2</th><th>P3</th><th>P4</th><th>Total</th><th>At risk / blocked</th></tr></thead>
@@ -1557,7 +1592,7 @@
     `;
     document.getElementById('approver-select').onchange = async (e) => {
       state.approverName = e.target.value;
-      await saveState();
+      if (!(await saveState())) return;
       showToast('Approver updated.');
       render();
     };
@@ -1585,15 +1620,15 @@
       state.pms[i] = inp.value.trim() || oldName;
       if (state.approverName === oldName) state.approverName = state.pms[i];
       state.tasks.forEach(t => { if (t.pm === oldName) t.pm = state.pms[i]; });
-      await saveState(); showToast('EM/PM updated.'); render();
+      if (!(await saveState())) return; showToast('EM/PM updated.'); render();
     });
     pmList.querySelectorAll('[data-pm-del]').forEach(btn => btn.onclick = async () => {
       if (!(await confirmModal('Remove this EM/PM from the list? Their existing requests will stay but show the old name.', 'Remove'))) return;
       state.pms.splice(Number(btn.dataset.pmDel), 1);
-      await saveState(); render();
+      if (!(await saveState())) return; render();
     });
     document.getElementById('add-pm').onclick = async () => {
-      state.pms.push('New EM/PM'); await saveState(); render();
+      state.pms.push('New EM/PM'); if (!(await saveState())) return; render();
     };
 
     baList.querySelectorAll('[data-ba-idx]').forEach(inp => inp.onchange = async () => {
@@ -1601,20 +1636,20 @@
       const oldName = state.bas[i].name;
       state.bas[i].name = inp.value.trim() || oldName;
       state.tasks.forEach(t => { if (t.ba === oldName) t.ba = state.bas[i].name; });
-      await saveState(); showToast('BA updated.'); render();
+      if (!(await saveState())) return; showToast('BA updated.'); render();
     });
     baList.querySelectorAll('[data-ba-cap]').forEach(inp => inp.onchange = async () => {
       const i = Number(inp.dataset.baCap);
       state.bas[i].weeklyCapacity = Number(inp.value) || 0;
-      await saveState(); showToast('Capacity updated.'); render();
+      if (!(await saveState())) return; showToast('Capacity updated.'); render();
     });
     baList.querySelectorAll('[data-ba-del]').forEach(btn => btn.onclick = async () => {
       if (!(await confirmModal('Remove this BA from the list? Their existing requests will stay but show the old name.', 'Remove'))) return;
       state.bas.splice(Number(btn.dataset.baDel), 1);
-      await saveState(); render();
+      if (!(await saveState())) return; render();
     });
     document.getElementById('add-ba').onclick = async () => {
-      state.bas.push({ name: 'New BA', weeklyCapacity: 30 }); await saveState(); render();
+      state.bas.push({ name: 'New BA', weeklyCapacity: 30 }); if (!(await saveState())) return; render();
     };
   }
 
@@ -1684,6 +1719,10 @@
           <p style="color:var(--ink-soft);font-size:11.5px;">"Who" is self-declared: the EM/PM you select when adding/editing a request is what gets logged for that action. Deleting, reopening, and rejecting don't ask for a name (to keep those quick, single-click actions) and log as "(unspecified)" or the approver's name \u2014 there's no login to verify identity either way, so treat this as a helpful record, not a tamper-proof audit trail.</p>
         </div>
         <div class="readme-section">
+          <h3>If you see "Someone else saved changes..."</h3>
+          <p>This tool is shared live by everyone on the team, so it's possible for two people to be editing at the same moment. If your save shows this message, it means someone else's change reached the shared data a moment before yours \u2014 rather than silently overwriting their work, your save is stopped and the page reloads the latest data automatically. Just redo whatever you were doing and save again; nothing is lost on your end, and nobody else's work gets erased either.</p>
+        </div>
+        <div class="readme-section">
           <h3>How the pick-up order is decided</h3>
           <p>Every open task assigned to a BA is ranked using, in order:</p>
           <ol>
@@ -1697,6 +1736,7 @@
           <h3>How BA Availability's "hrs used this sprint" works</h3>
           <p>Completing a task does <b>not</b> free up hours for the rest of the sprint. Each BA's "hrs used this sprint" is the sum of hours still open <i>plus</i> hours already completed this sprint \u2014 so marking a task Completed just moves its hours from "still open" to "completed," without changing the total. The breakdown line under the bar (e.g., "28 hrs still open + 6 hrs completed this sprint") always shows both pieces, so it's clear where the hours sit without the top-line number ever jumping around.</p>
           <p>"Hrs realistically left this sprint" takes that stable total and additionally caps it by how many working days are actually left in the current Monday\u2013Friday window \u2014 it will never show more than what a BA could physically get through in the days remaining. If the uncapped budget figure differs from this (i.e., the sprint is nearly over), it's shown alongside in parentheses for context. Together, these two changes mean the numbers only move when something genuinely changes a BA's future workload \u2014 a new request, a priority change, or the sprint rolling over \u2014 never just because a task got marked done.</p>
+          <p>If a task's Target Start falls within this sprint but its Est. End extends beyond it (a multi-sprint task), only the portion of its hours that overlaps <i>this</i> sprint counts toward this sprint's capacity \u2014 not the full total. On Tracker, the Hrs column shows a small note like "100 (40 this sprint)" whenever this applies, so it's clear the full estimate and the sprint-scoped share are different numbers on purpose.</p>
         </div>
         <div class="readme-section">
           <h3>Priority legend</h3>
@@ -1727,6 +1767,4 @@
   })();
 })();
 </script>
-
-</body>
-</html>
+</body></html>
