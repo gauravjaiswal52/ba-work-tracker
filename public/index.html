@@ -201,6 +201,13 @@
 #ba-app .unassigned-tag { color: var(--amber); font-weight: 600; }
 
 #ba-app .capacitybar-wrap { width: 100%; }
+#ba-app .daily-load-strip { display: flex; gap: 3px; margin-top: 10px; }
+#ba-app .daily-load-cell { flex: 1; min-width: 0; text-align: center; cursor: default; }
+#ba-app .daily-load-cell .bar { height: 26px; border-radius: 4px; display: flex; align-items: flex-end; justify-content: center; overflow: hidden; background: var(--surface-alt); position: relative; }
+#ba-app .daily-load-cell .bar-fill { width: 100%; border-radius: 4px 4px 0 0; }
+#ba-app .daily-load-cell .lbl { font-size: 9px; color: var(--ink-faint); margin-top: 3px; font-family: var(--font-mono); }
+#ba-app .daily-load-heading { display: flex; align-items: center; justify-content: space-between; margin-top: 12px; }
+#ba-app .daily-load-heading .lbl { font-size: 10.5px; text-transform: uppercase; letter-spacing: .03em; color: var(--ink-soft); }
 #ba-app .capacitybar { position: relative; height: 10px; border-radius: 6px; background: var(--surface-alt); overflow: hidden; }
 #ba-app .capacitybar .fill { position: absolute; left:0; top:0; bottom:0; border-radius: 6px 0 0 6px; }
 #ba-app .capacitybar .overmark { position: absolute; right: -1px; top: -2px; bottom: -2px; width: 3px; background: var(--red); }
@@ -397,20 +404,17 @@
           loadFailed = false;
           return;
         }
-        // res.ok but no data at all - genuinely nothing saved yet, safe to seed defaults
         state = defaultState();
         loadedVersion = 0;
         loadFailed = false;
         await saveState();
         return;
       }
-      // Server reachable but returned an error - do NOT touch/overwrite whatever is actually saved
       loadFailed = true;
       state = defaultState();
       showToast('Could not load the latest data from the server (error ' + res.status + '). Please refresh before making any changes - nothing has been overwritten.');
       return;
     } catch(e) {
-      // Network/connection failure - do NOT touch/overwrite whatever is actually saved
       loadFailed = true;
       state = defaultState();
       showToast('Could not reach the server to load data. Please check your connection and refresh before making any changes - nothing has been overwritten.');
@@ -528,6 +532,44 @@
       d.setDate(d.getDate() + 1);
     }
     return count;
+  }
+
+  function listWorkingDays(start, end){
+    const days = [];
+    if (!start || !end || end < start) return days;
+    const d = new Date(start + 'T00:00:00');
+    const e = new Date(end + 'T00:00:00');
+    while (d <= e) {
+      const day = d.getDay();
+      if (day !== 0 && day !== 6) days.push(localISODate(d));
+      d.setDate(d.getDate() + 1);
+    }
+    return days;
+  }
+
+  // Spreads each task's hours evenly across its own working days, then sums
+  // by day for one BA - surfaces days that are locally choked (many tasks'
+  // date ranges clustered together) even when the BA's sprint-wide total
+  // looks fine.
+  function computeDailyLoad(enriched, windowStart, windowEnd, baName, dailyCapacity){
+    const days = listWorkingDays(windowStart, windowEnd);
+    const totals = {};
+    days.forEach(d => { totals[d] = 0; });
+
+    enriched.filter(t => t.ba === baName && t.active && t.targetStart && t.estEnd).forEach(t => {
+      const totalDays = workingDaysBetween(t.targetStart, t.estEnd);
+      if (totalDays <= 0) return;
+      const dailyRate = (Number(t.hours) || 0) / totalDays;
+      days.forEach(d => {
+        if (d >= t.targetStart && d <= t.estEnd) totals[d] += dailyRate;
+      });
+    });
+
+    return days.map(d => {
+      const load = totals[d];
+      const pct = dailyCapacity > 0 ? load / dailyCapacity : 0;
+      return { date: d, load: Math.round(load * 10) / 10, pct };
+    });
   }
 
   function computeDerived(){
@@ -720,7 +762,7 @@
 
   function renderTracker(){
     const { enriched, windowStart, windowEnd } = computeDerived();
-    const filters = window.__baFilters || { ba:'', pm:'', priority:'', status:'', sprint:'', dateFrom:'', dateTo:'', completeness:'', eddFrom:'', eddTo:'' };
+    const filters = window.__baFilters || { ba:'', pm:'', priority:'', status:'', sprint:'', dateFrom:'', dateTo:'', completeness:'', eddFrom:'', eddTo:'', endFrom:'', endTo:'' };
     window.__baFilters = filters;
     if (!window.__baSort) window.__baSort = { key: null, dir: 'asc' };
 
@@ -738,6 +780,14 @@
         if (!t.targetStart || !t.estEnd) return true; // no dates yet \u2014 can't range-check, keep visible
         if (filters.dateFrom && t.estEnd < filters.dateFrom) return false;
         if (filters.dateTo && t.targetStart > filters.dateTo) return false;
+        return true;
+      });
+    }
+    if (filters.endFrom || filters.endTo) {
+      rows = rows.filter(t => {
+        if (!t.estEnd) return true; // no end date yet \u2014 can't filter, keep visible
+        if (filters.endFrom && t.estEnd < filters.endFrom) return false;
+        if (filters.endTo && t.estEnd > filters.endTo) return false;
         return true;
       });
     }
@@ -794,11 +844,18 @@
             <option value="complete" ${filters.completeness==='complete'?'selected':''}>Complete only</option>
           </select>
           <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--ink-soft);">
-            Date range:
+            Start\u2013End overlap:
             <input type="date" id="f-date-from" value="${filters.dateFrom}"/>
             <span>to</span>
             <input type="date" id="f-date-to" value="${filters.dateTo}"/>
             ${(filters.dateFrom||filters.dateTo) ? `<button class="btn btn-ghost btn-sm" id="btn-clear-dates">Clear</button>` : ''}
+          </label>
+          <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--ink-soft);">
+            Est. End Date:
+            <input type="date" id="f-end-from" value="${filters.endFrom}"/>
+            <span>to</span>
+            <input type="date" id="f-end-to" value="${filters.endTo}"/>
+            ${(filters.endFrom||filters.endTo) ? `<button class="btn btn-ghost btn-sm" id="btn-clear-end">Clear</button>` : ''}
           </label>
           <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--ink-soft);">
             Project EDD:
@@ -835,6 +892,10 @@
     document.getElementById('f-date-to').onchange = e => { filters.dateTo = e.target.value; render(); };
     const clearDatesBtn = document.getElementById('btn-clear-dates');
     if (clearDatesBtn) clearDatesBtn.onclick = () => { filters.dateFrom = ''; filters.dateTo = ''; render(); };
+    document.getElementById('f-end-from').onchange = e => { filters.endFrom = e.target.value; render(); };
+    document.getElementById('f-end-to').onchange = e => { filters.endTo = e.target.value; render(); };
+    const clearEndBtn = document.getElementById('btn-clear-end');
+    if (clearEndBtn) clearEndBtn.onclick = () => { filters.endFrom = ''; filters.endTo = ''; render(); };
     document.getElementById('f-edd-from').onchange = e => { filters.eddFrom = e.target.value; render(); };
     document.getElementById('f-edd-to').onchange = e => { filters.eddTo = e.target.value; render(); };
     const clearEddBtn = document.getElementById('btn-clear-edd');
@@ -1385,13 +1446,16 @@
   function renderAvailability(){
     const { enriched, windowStart, windowEnd, today } = computeDerived();
     const avail = computeBAAvailability(enriched, windowStart, windowEnd, today);
+    avail.forEach(a => {
+      a.dailyLoad = computeDailyLoad(enriched, windowStart, windowEnd, a.name, a.weeklyCapacity / 5);
+    });
     const waitingUnassigned = enriched.filter(t=>t.active && t.ba==='Unassigned');
     const waitingHours = waitingUnassigned.reduce((s,t)=>s+(Number(t.hours)||0),0);
 
     root.innerHTML = `
       <div class="pagehead">
         <h1>BA Availability</h1>
-        <p>Committed hours vs. 2-week capacity for each BA, capped by working days actually left in this sprint, plus the single task they should pick up next.</p>
+        <p>Committed hours vs. 2-week capacity for each BA, capped by working days actually left in this sprint, plus a day-by-day view showing which specific days are choked even when the sprint total looks fine.</p>
       </div>
       <div class="statrow">
         <div class="statcard"><div class="n mono">${waitingUnassigned.length}</div><div class="l">Unassigned requests waiting</div></div>
@@ -1403,11 +1467,38 @@
         <div class="legend-key">
           <span><i style="background:var(--teal)"></i>Committed hours</span>
           <span><i style="background:var(--red)"></i>Over capacity marker</span>
+          <span><i style="background:var(--green-soft)"></i>Day: light load</span>
+          <span><i style="background:var(--amber-soft)"></i>Day: near capacity</span>
+          <span><i style="background:var(--red-soft)"></i>Day: choked</span>
         </div>
         <div style="margin-top:14px;">
           ${avail.map(a => baCardHtml(a)).join('')}
         </div>
       </div>
+    `;
+  }
+
+  function dailyLoadStripHtml(dailyLoad){
+    if (!dailyLoad || !dailyLoad.length) return '';
+    const cells = dailyLoad.map(d => {
+      const dt = new Date(d.date + 'T00:00:00');
+      const dow = dt.toLocaleDateString('en-GB', { weekday: 'short' }).slice(0,2);
+      const dnum = dt.getDate();
+      const pct = Math.max(0, Math.min(d.pct, 1.5));
+      const heightPct = Math.min(pct, 1) * 100;
+      let barColor = 'var(--teal)', cellBg = 'transparent';
+      if (d.pct > 1) { barColor = 'var(--red)'; }
+      else if (d.pct >= 0.75) { barColor = 'var(--amber)'; }
+      else { barColor = 'var(--teal)'; }
+      const overTag = d.pct > 1 ? ' \u26a0' : '';
+      return `<div class="daily-load-cell" title="${dow} ${fmtDate(d.date)}: ${d.load} hrs load${overTag}">
+        <div class="bar"><div class="bar-fill" style="height:${Math.max(heightPct,4)}%; background:${barColor};"></div></div>
+        <div class="lbl">${dow}${dnum}</div>
+      </div>`;
+    }).join('');
+    return `
+      <div class="daily-load-heading"><span class="lbl">Daily load this sprint</span></div>
+      <div class="daily-load-strip">${cells}</div>
     `;
   }
 
@@ -1429,10 +1520,14 @@
     const usedBreakdown = a.completedHours > 0
       ? `${a.committed} hrs still open + ${a.completedHours} hrs completed this sprint`
       : `${a.committed} hrs open`;
+    const chokedDays = (a.dailyLoad || []).filter(d => d.pct > 1).length;
+    const chokedNote = chokedDays > 0
+      ? ` <span class="pill pill-atrisk" title="These specific days have more work landing on them than the daily capacity allows, even though the sprint total may look fine">${chokedDays} day${chokedDays===1?'':'s'} choked</span>`
+      : '';
     return `
       <div class="bacard">
         <div class="bacard-top">
-          <div class="bacard-name">${escapeHtml(a.name)}</div>
+          <div class="bacard-name">${escapeHtml(a.name)}${chokedNote}</div>
           <span class="pill ${statusCls}">${a.status}</span>
         </div>
         <div class="capacitybar-wrap">
@@ -1447,6 +1542,7 @@
           <div class="capline" style="margin-top:2px;">
             <span style="color:var(--ink-faint);">${usedBreakdown} · ${a.daysLeft} working day${a.daysLeft===1?'':'s'} left</span>
           </div>
+          ${dailyLoadStripHtml(a.dailyLoad)}
         </div>
         ${nextUpHtml}
       </div>
@@ -1614,10 +1710,11 @@
         <div class="filters">
           <select id="approver-select">${state.pms.map(p=>`<option ${p===state.approverName?'selected':''}>${escapeHtml(p)}</option>`).join('')}</select>
         </div>
-        <div class="sub" style="margin-top:14px;">Optional approval code \u2014 if set, ${escapeHtml(state.approverName)} must enter it to approve anything. Leave blank to turn this off. Since there's no login system, treat this as a light deterrent against casual clicks, not real security \u2014 anyone who can view this page's data could see it with enough technical effort.</div>
+        <div class="sub" style="margin-top:14px;">Optional approval code \u2014 if set, ${escapeHtml(state.approverName)} must enter it to approve anything. Since there's no login system, treat this as a light deterrent against casual clicks, not real security \u2014 anyone who can view this page's data could see it with enough technical effort. This field never displays the current code, on screen or in the page's source \u2014 only re-enter a new one to change it.</div>
         <div class="filters">
-          <input type="password" id="approval-code-input" placeholder="No code set" value="${escapeHtml(state.approvalCode||'')}" style="max-width:180px;"/>
-          <button class="btn btn-ghost btn-sm" id="toggle-code-visibility">Show</button>
+          <input type="password" id="approval-code-input" placeholder="${state.approvalCode ? 'Code is set — type to change it' : 'No code set'}" value="" style="max-width:220px;"/>
+          <button class="btn btn-primary btn-sm" id="save-code-btn">Save code</button>
+          ${state.approvalCode ? `<button class="btn btn-danger btn-sm" id="clear-code-btn">Clear code</button>` : ''}
         </div>
       </div>
       <div class="card">
@@ -1638,16 +1735,20 @@
       showToast('Approver updated.');
       render();
     };
-    document.getElementById('approval-code-input').onchange = async (e) => {
-      state.approvalCode = e.target.value.trim();
+    document.getElementById('save-code-btn').onclick = async () => {
+      const val = document.getElementById('approval-code-input').value.trim();
+      if (!val) { showToast('Type a new code first, or use Clear code to remove it.'); return; }
+      state.approvalCode = val;
       if (!(await saveState())) return;
-      showToast(state.approvalCode ? 'Approval code set.' : 'Approval code removed \u2014 approvals no longer require a code.');
+      showToast('Approval code updated.');
+      render();
     };
-    document.getElementById('toggle-code-visibility').onclick = (e) => {
-      const input = document.getElementById('approval-code-input');
-      const isPassword = input.type === 'password';
-      input.type = isPassword ? 'text' : 'password';
-      e.target.textContent = isPassword ? 'Hide' : 'Show';
+    const clearCodeBtn = document.getElementById('clear-code-btn');
+    if (clearCodeBtn) clearCodeBtn.onclick = async () => {
+      state.approvalCode = '';
+      if (!(await saveState())) return;
+      showToast('Approval code removed \u2014 approvals no longer require a code.');
+      render();
     };
     const pmList = document.getElementById('pm-list');
     state.pms.forEach((pm, i) => {
@@ -1753,7 +1854,7 @@
         </div>
         <div class="readme-section">
           <h3>Filtering the Tracker</h3>
-          <p>Beyond BA, EM/PM, Priority, and Status, Tracker has four more filters: <b>"In this sprint / Outside this sprint"</b> shows only tasks whose dates overlap the current Monday\u2013Friday sprint window, or only the ones that don't; a <b>date range</b> filter (From / To) shows tasks whose Target Start\u2013Est. End overlaps any custom range you pick; a <b>Project EDD</b> range filter (From / To) does the same for that optional date; and <b>"Incomplete only / Complete only"</b> isolates tasks missing Priority, dates, or Hours so you can quickly find and finish setting them up. Tasks with no dates yet always stay visible through either date filter, since there's nothing to range-check.</p>
+          <p>Beyond BA, EM/PM, Priority, and Status, Tracker has five more filters: <b>"In this sprint / Outside this sprint"</b> shows only tasks whose dates overlap the current Monday\u2013Friday sprint window, or only the ones that don't; a <b>Start\u2013End overlap</b> range filter (From / To) shows tasks whose Target Start\u2013Est. End overlaps any custom range you pick; an <b>Est. End Date</b> range filter (From / To) shows tasks whose end date specifically falls within a range \u2014 useful for finding everything due by a certain point, regardless of when it started; a <b>Project EDD</b> range filter (From / To) does the same for that optional date; and <b>"Incomplete only / Complete only"</b> isolates tasks missing Priority, dates, or Hours so you can quickly find and finish setting them up. Tasks with no dates yet always stay visible through any date filter, since there's nothing to range-check.</p>
         </div>
         <div class="readme-section">
           <h3>Sorting and archive</h3>
@@ -1791,6 +1892,10 @@
           <p>Completing a task does <b>not</b> free up hours for the rest of the sprint. Each BA's "hrs used this sprint" is the sum of hours still open <i>plus</i> hours already completed this sprint \u2014 so marking a task Completed just moves its hours from "still open" to "completed," without changing the total. The breakdown line under the bar (e.g., "28 hrs still open + 6 hrs completed this sprint") always shows both pieces, so it's clear where the hours sit without the top-line number ever jumping around.</p>
           <p>"Hrs realistically left this sprint" takes that stable total and additionally caps it by how many working days are actually left in the current Monday\u2013Friday window \u2014 it will never show more than what a BA could physically get through in the days remaining. If the uncapped budget figure differs from this (i.e., the sprint is nearly over), it's shown alongside in parentheses for context. Together, these two changes mean the numbers only move when something genuinely changes a BA's future workload \u2014 a new request, a priority change, or the sprint rolling over \u2014 never just because a task got marked done.</p>
           <p>If a task's Target Start falls within this sprint but its Est. End extends beyond it (a multi-sprint task), only the portion of its hours that overlaps <i>this</i> sprint counts toward this sprint's capacity \u2014 not the full total. On Tracker, the Hrs column shows a small note like "100 (40 this sprint)" whenever this applies, so it's clear the full estimate and the sprint-scoped share are different numbers on purpose.</p>
+        </div>
+        <div class="readme-section">
+          <h3>Daily load \u2014 spotting choked days within an otherwise fine sprint</h3>
+          <p>A BA can look fine on the sprint-wide total while still having a few specific days where far too much lands at once \u2014 e.g., five short tasks that all happen to start and end in the same couple of days. The <b>"Daily load this sprint"</b> strip on each BA's card breaks the sprint into its individual working days and shows how much work is spread across each one: every task's hours are divided evenly across its own date range, then summed per day. Green bars mean a light day, amber means a day is nearing that BA's daily capacity, and red (with a small warning mark) means more is landing on that day than they can realistically get through \u2014 hover any bar for the exact date and hours. If any days are flagged, a <b>"X days choked"</b> tag appears next to the BA's name, even when their overall status still says "Available."</p>
         </div>
         <div class="readme-section">
           <h3>Priority legend</h3>
