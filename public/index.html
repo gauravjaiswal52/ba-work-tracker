@@ -337,7 +337,7 @@
   }
 
   function mkTask(id,pm,ba,project,task,hours,priority,status,dateRequested,targetStart,estEnd,notes,projectEDD){
-    return {id,pm,ba,project,task,hours,priority,status,dateRequested,targetStart,estEnd,notes,completedDate:null,awaitingApproval:false,pendingChange:null,projectEDD:projectEDD||null};
+    return {id,pm,ba,project,task,hours,priority,status,dateRequested,targetStart,estEnd,notes,completedDate:null,awaitingApproval:false,pendingChange:null,projectEDD:projectEDD||null,actualHours:null};
   }
 
   function logActivity(taskId, taskLabel, action, by, detail){
@@ -498,9 +498,22 @@
   function escapeHtml(s){
     return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   }
+  function actualHoursCellHtml(t){
+    const hasActual = !(t.actualHours===null||t.actualHours===''||t.actualHours===undefined);
+    if (!hasActual) return '—';
+    const hasEst = !(t.hours===null||t.hours===''||t.hours===undefined) && Number(t.hours) > 0;
+    let variance = '';
+    if (hasEst) {
+      const pct = Math.round(((Number(t.actualHours) - Number(t.hours)) / Number(t.hours)) * 100);
+      const color = pct > 0 ? 'var(--red)' : (pct < 0 ? 'var(--teal)' : 'var(--ink-faint)');
+      const sign = pct > 0 ? '+' : '';
+      variance = ` <span style="color:${color};font-size:10px;" title="Actual vs. estimated man-hours">(${sign}${pct}%)</span>`;
+    }
+    return `${t.actualHours}${variance}`;
+  }
 
   const GATED_FIELDS = ['ba','hours','priority','targetStart','estEnd'];
-  const FIELD_LABELS = { ba:'Business Analyst', hours:'Est. man-hours', priority:'Priority', targetStart:'Target start date', estEnd:'Est. end date', projectEDD:'Project EDD', project:'Project', task:'Task', notes:'Notes', status:'Status' };
+  const FIELD_LABELS = { ba:'Business Analyst', hours:'Est. man-hours', actualHours:'Actual man-hours', priority:'Priority', targetStart:'Target start date', estEnd:'Est. end date', projectEDD:'Project EDD', project:'Project', task:'Task', notes:'Notes', status:'Status' };
   function isOpenWindowDay(){
     const { end } = getPlanningWindow();
     const todayStr = todayISO();
@@ -716,7 +729,17 @@
       const totalOpenHoursAllTime = open.reduce((s,t) => s + (Number(t.hours)||0), 0);
       const manDaysOpen = dailyCapacity > 0 ? totalOpenHoursAllTime / dailyCapacity : 0;
 
-      return { name: ba.name, weeklyCapacity: ba.weeklyCapacity, cap2w, committed, completedHours, totalUsed, remaining, realisticRemaining, daysLeft, util, risk, p1p2, status, nextUp, openCount: open.length, totalOpenHoursAllTime, manDaysOpen };
+      // Actual vs. estimated man-hours, across all completed tasks (any sprint)
+      // that have actual hours logged - a track record view, not sprint-scoped,
+      // since actuals are usually only logged once, at completion.
+      const completedWithActuals = enriched.filter(t =>
+        t.ba === ba.name && t.status === 'Completed' &&
+        t.actualHours !== null && t.actualHours !== undefined && t.actualHours !== '');
+      const estForThose = completedWithActuals.reduce((s,t) => s + (Number(t.hours)||0), 0);
+      const actualForThose = completedWithActuals.reduce((s,t) => s + (Number(t.actualHours)||0), 0);
+      const actualVsEstPct = estForThose > 0 ? Math.round(((actualForThose - estForThose) / estForThose) * 100) : null;
+
+      return { name: ba.name, weeklyCapacity: ba.weeklyCapacity, cap2w, committed, completedHours, totalUsed, remaining, realisticRemaining, daysLeft, util, risk, p1p2, status, nextUp, openCount: open.length, totalOpenHoursAllTime, manDaysOpen, completedWithActualsCount: completedWithActuals.length, estForThose, actualForThose, actualVsEstPct };
     });
   }
 
@@ -897,7 +920,7 @@
         <div class="tablewrap">
           <table>
             <thead><tr>
-              <th>S.No.</th>${trackerHeaderCell('ba','BA')}${trackerHeaderCell('pm','EM/PM')}${trackerHeaderCell('project','Project')}${trackerHeaderCell('projectEDD','Project EDD')}${trackerHeaderCell('task','Task')}${trackerHeaderCell('hours','Hrs')}${trackerHeaderCell('priority','Priority')}${trackerHeaderCell('pickupOrder','Pick-up order')}${trackerHeaderCell('status','Status')}${trackerHeaderCell('dateRequested','Date requested')}${trackerHeaderCell('targetStart','Target start')}${trackerHeaderCell('estEnd','Est. end')}${trackerHeaderCell('daysRemaining','Days left')}${trackerHeaderCell('cumulativeHours','Cum. hrs')}${trackerHeaderCell('fitsCapacity','Fits now?')}${trackerHeaderCell('notes','Notes')}<th></th>
+              <th>S.No.</th>${trackerHeaderCell('ba','BA')}${trackerHeaderCell('pm','EM/PM')}${trackerHeaderCell('project','Project')}${trackerHeaderCell('projectEDD','Project EDD')}${trackerHeaderCell('task','Task')}${trackerHeaderCell('hours','Hrs')}${trackerHeaderCell('actualHours','Actual Hrs')}${trackerHeaderCell('priority','Priority')}${trackerHeaderCell('pickupOrder','Pick-up order')}${trackerHeaderCell('status','Status')}${trackerHeaderCell('dateRequested','Date requested')}${trackerHeaderCell('targetStart','Target start')}${trackerHeaderCell('estEnd','Est. end')}${trackerHeaderCell('daysRemaining','Days left')}${trackerHeaderCell('cumulativeHours','Cum. hrs')}${trackerHeaderCell('fitsCapacity','Fits now?')}${trackerHeaderCell('notes','Notes')}<th></th>
             </tr></thead>
             <tbody>
               ${rows.length ? rows.map((t,i) => rowHtml(t,i)).join('') : `<tr><td colspan="18" class="empty">No requests match these filters yet.</td></tr>`}
@@ -953,6 +976,7 @@
       <td class="mono">${fmtDate(t.projectEDD)}</td>
       <td class="wrap">${escapeHtml(t.task)}</td>
       <td class="mono">${(t.hours===null||t.hours===''||t.hours===undefined)?'—':t.hours}${(t.dataComplete && Math.round(t.inSprintHours*10)!==Math.round((Number(t.hours)||0)*10)) ? ` <span style="color:var(--ink-faint);font-size:10px;" title="This task's dates extend beyond the current sprint - only this many of its total hours count toward this sprint's capacity">(${Math.round(t.inSprintHours*10)/10} this sprint)</span>` : ''}</td>
+      <td class="mono">${actualHoursCellHtml(t)}</td>
       <td>${pillForPriority(t.priority)}</td>
       <td>${rankCell}</td>
       <td>${pillForStatus(t.status)}${t.pendingChange ? ' <span class="pill pill-newreq" title="Change awaiting approval">Edit pending</span>' : ''}${!t.dataComplete ? ' <span class="pill pill-atrisk" title="Missing Priority, Target Start, Est. End, or Hours — add these to include this task in sequencing">Incomplete</span>' : ''}</td>
@@ -986,6 +1010,7 @@
           <div class="field"><label>Project / initiative</label><input type="text" id="m-project" value="${escapeHtml(t.project)}"/></div>
           <div class="field"><label>Project EDD <span style="font-weight:400;color:var(--ink-soft);">(optional)</span></label><input type="date" id="m-project-edd" value="${t.projectEDD||''}"/></div>
           <div class="field"><label>Est. man-hours</label><input type="number" min="0" step="0.5" id="m-hours" placeholder="Unknown" value="${t.hours===null||t.hours===undefined?'':t.hours}"/></div>
+          <div class="field"><label>Actual man-hours <span style="font-weight:400;color:var(--ink-soft);">(optional)</span></label><input type="number" min="0" step="0.5" id="m-actual-hours" placeholder="Not logged yet" value="${t.actualHours===null||t.actualHours===undefined?'':t.actualHours}"/></div>
           <div class="field"><label>Priority</label><select id="m-priority"><option value="" ${!t.priority?'selected':''}>\u2014 Unknown \u2014</option>${PRIORITY_OPTS.map(p=>`<option ${p===t.priority?'selected':''}>${p}</option>`).join('')}</select></div>
           <div class="field"><label>Request status</label><select id="m-status">${STATUS_OPTS.map(s=>`<option ${s===t.status?'selected':''}>${s}</option>`).join('')}</select></div>
           <div class="field"><label>Date requested</label><input type="date" id="m-reqdate" value="${t.dateRequested||''}"/></div>
@@ -1005,6 +1030,7 @@
     backdrop.addEventListener('click', e => { if (e.target === backdrop) backdrop.remove(); });
     document.getElementById('m-save').onclick = async () => {
       const hoursRaw = document.getElementById('m-hours').value;
+      const actualHoursRaw = document.getElementById('m-actual-hours').value;
       const payload = {
         pm: document.getElementById('m-pm').value,
         ba: document.getElementById('m-ba').value,
@@ -1012,6 +1038,7 @@
         projectEDD: document.getElementById('m-project-edd').value,
         task: document.getElementById('m-task').value.trim(),
         hours: hoursRaw === '' ? null : Number(hoursRaw),
+        actualHours: actualHoursRaw === '' ? null : Number(actualHoursRaw),
         priority: document.getElementById('m-priority').value,
         status: document.getElementById('m-status').value,
         dateRequested: document.getElementById('m-reqdate').value,
@@ -1030,11 +1057,11 @@
       let toastMsg = id ? 'Request updated.' : 'Request added.';
       if (payload.completedDate && id) toastMsg = 'Request completed \u2014 moved to Archive.';
 
-      const LOG_FIELDS = ['ba','hours','priority','targetStart','estEnd','project','projectEDD','task','notes','status'];
+      const LOG_FIELDS = ['ba','hours','actualHours','priority','targetStart','estEnd','project','projectEDD','task','notes','status'];
       const fieldDisplay = (f,v) => {
         if (f === 'priority') return v || '(blank)';
         if (f === 'targetStart' || f === 'estEnd' || f === 'projectEDD') return v ? fmtDate(v) : '(blank)';
-        if (f === 'hours') return (v===null||v===''||v===undefined) ? '(blank)' : v;
+        if (f === 'hours' || f === 'actualHours') return (v===null||v===''||v===undefined) ? '(blank)' : v;
         return v || '(blank)';
       };
 
@@ -1094,11 +1121,11 @@
   }
 
   // ---- CSV import ----
-  const CSV_HEADERS = ['EM/PM','BA','Project','Project EDD','Task','Hours','Priority','Status','Date Requested','Target Start','Est End','Notes'];
+  const CSV_HEADERS = ['EM/PM','BA','Project','Project EDD','Task','Hours','Actual Hours','Priority','Status','Date Requested','Target Start','Est End','Notes'];
 
   function downloadCsvTemplate(){
-    const sampleRow1 = ['Nimish','Aakash','Sample Project',todayISO(),'Describe the task here',8,'P3','New Request',todayISO(),todayISO(),todayISO(),''];
-    const sampleRow2 = ['Gaurav','','Another project','','Task with details still unknown','','','New Request',todayISO(),'','','Project EDD is optional and doesn\u2019t affect anything else \u2014 leave it blank if unknown'];
+    const sampleRow1 = ['Nimish','Aakash','Sample Project',todayISO(),'Describe the task here',8,'','P3','New Request',todayISO(),todayISO(),todayISO(),''];
+    const sampleRow2 = ['Gaurav','','Another project','','Task with details still unknown','','','','New Request',todayISO(),'','','Project EDD is optional and doesn\u2019t affect anything else \u2014 leave it blank if unknown'];
     const rowsCsv = [sampleRow1, sampleRow2].map(r => r.map(v => `"${String(v).replace(/"/g,'""')}"`).join(','));
     const csv = [CSV_HEADERS.join(','), ...rowsCsv].join('\r\n');
     const blob = new Blob([csv], { type: 'text/csv' });
@@ -1119,6 +1146,7 @@
     'projectedd':'projectEDD','edd':'projectEDD','expecteddeliverydate':'projectEDD','projectexpecteddeliverydate':'projectEDD',
     'task':'task','taskdescription':'task',
     'hours':'hours','estmanhours':'hours','manhours':'hours',
+    'actualhours':'actualHours','actualmanhours':'actualHours',
     'priority':'priority',
     'status':'status','requeststatus':'status',
     'daterequested':'dateRequested',
@@ -1168,6 +1196,9 @@
       let hours = (row.hours !== undefined && String(row.hours).trim() !== '') ? Number(row.hours) : null;
       if (hours !== null && (!Number.isFinite(hours) || hours < 0)) hours = null;
 
+      let actualHours = (row.actualHours !== undefined && String(row.actualHours).trim() !== '') ? Number(row.actualHours) : null;
+      if (actualHours !== null && (!Number.isFinite(actualHours) || actualHours < 0)) actualHours = null;
+
       let priority = (row.priority || '').trim().toUpperCase();
       if (!PRIORITY_OPTS.includes(priority)) priority = '';
 
@@ -1183,7 +1214,7 @@
       if (gate) pendingCount++;
 
       const newTask = {
-        id: state.nextId++, pm, ba, project: (row.project||'').trim(), projectEDD, task, hours, priority, status,
+        id: state.nextId++, pm, ba, project: (row.project||'').trim(), projectEDD, task, hours, actualHours, priority, status,
         dateRequested, targetStart, estEnd, notes: (row.notes||'').trim(),
         completedDate: status === 'Completed' ? todayISO() : null,
         awaitingApproval: gate, pendingChange: null,
@@ -1272,7 +1303,7 @@
         <div class="tablewrap">
           <table>
             <thead><tr>
-              ${archiveHeader('ba','BA')}${archiveHeader('pm','EM/PM')}${archiveHeader('project','Project')}${archiveHeader('task','Task')}${archiveHeader('hours','Hrs')}${archiveHeader('priority','Priority')}${archiveHeader('completedDate','Completed')}${archiveHeader('notes','Notes')}<th></th>
+              ${archiveHeader('ba','BA')}${archiveHeader('pm','EM/PM')}${archiveHeader('project','Project')}${archiveHeader('task','Task')}${archiveHeader('hours','Hrs')}${archiveHeader('actualHours','Actual Hrs')}${archiveHeader('priority','Priority')}${archiveHeader('completedDate','Completed')}${archiveHeader('notes','Notes')}<th></th>
             </tr></thead>
             <tbody>
               ${rows.length ? rows.map(t => archiveRowHtml(t)).join('') : `<tr><td colspan="9" class="empty">No completed requests yet.</td></tr>`}
@@ -1302,6 +1333,7 @@
       <td class="wrap">${escapeHtml(t.project)}</td>
       <td class="wrap">${escapeHtml(t.task)}</td>
       <td class="mono">${(t.hours===null||t.hours===''||t.hours===undefined)?'—':t.hours}</td>
+      <td class="mono">${actualHoursCellHtml(t)}</td>
       <td>${pillForPriority(t.priority)}</td>
       <td class="mono">${fmtDate(t.completedDate)}</td>
       <td class="wrap">${escapeHtml(t.notes)}</td>
@@ -1583,8 +1615,23 @@
             <span style="color:var(--ink-soft);" title="Total hours of everything still open and not completed for this BA, converted to man-days using their weekly capacity - not limited to this sprint, so this reflects their true backlog size regardless of task dates">${Math.round(a.manDaysOpen*10)/10} man-days of open work</span>
             <span style="color:var(--ink-faint);">${a.totalOpenHoursAllTime} total open hrs</span>
           </div>
+          ${actualVsEstHtml(a)}
         </div>
         ${nextUpHtml}
+      </div>
+    `;
+  }
+
+  function actualVsEstHtml(a){
+    if (a.completedWithActualsCount === 0) {
+      return `<div class="capline" style="margin-top:4px;"><span style="color:var(--ink-faint);">No actual hours logged yet on completed tasks</span></div>`;
+    }
+    const pctColor = a.actualVsEstPct === null ? 'var(--ink-faint)' : (a.actualVsEstPct > 10 ? 'var(--red)' : (a.actualVsEstPct < -10 ? 'var(--teal)' : 'var(--ink-soft)'));
+    const pctText = a.actualVsEstPct === null ? '' : ` <span style="color:${pctColor};font-weight:600;">(${a.actualVsEstPct > 0 ? '+' : ''}${a.actualVsEstPct}% vs. estimate)</span>`;
+    return `
+      <div class="capline" style="margin-top:4px;">
+        <span style="color:var(--ink-soft);" title="Actual hours logged vs. their original estimate, across all completed tasks that have actual hours filled in - a running track record, not limited to this sprint">${a.actualForThose} actual hrs vs ${a.estForThose} est. hrs${pctText}</span>
+        <span style="color:var(--ink-faint);">${a.completedWithActualsCount} completed task${a.completedWithActualsCount===1?'':'s'} logged</span>
       </div>
     `;
   }
@@ -1937,6 +1984,11 @@
         <div class="readme-section">
           <h3>Daily load \u2014 spotting choked days within an otherwise fine sprint</h3>
           <p>A BA can look fine on the sprint-wide total while still having a few specific days where far too much lands at once \u2014 e.g., five short tasks that all happen to start and end in the same couple of days. The <b>"Daily load this sprint"</b> strip on each BA's card breaks the sprint into its individual working days and shows how much work is spread across each one: every task's hours are divided evenly across its own date range, then summed per day. Green bars mean a light day, amber means a day is nearing that BA's daily capacity, and red (with a small warning mark) means more is landing on that day than they can realistically get through \u2014 hover any bar for the exact date and hours. If any days are flagged, a <b>"X days choked"</b> tag appears next to the BA's name, even when their overall status still says "Available."</p>
+        </div>
+        <div class="readme-section">
+          <h3>Actual man-hours vs. estimate</h3>
+          <p>Every task now has an optional <b>Actual man-hours</b> field alongside the original estimate \u2014 fill it in whenever real effort is known, usually once a task is Completed. It's never gated, so logging it applies immediately without needing approval. On Tracker and Archive, the "Actual Hrs" column shows the value with a colored variance badge (e.g. "+30%") comparing it to that task's own estimate.</p>
+          <p>Each BA's card on the <b>BA Availability</b> tab shows a running summary: total actual hours vs. total estimated hours across every completed task that has actuals logged, with an overall variance percentage and a count of how many tasks that's based on. This is a running track record across all sprints, not just the current one \u2014 since actuals are usually only logged once, at completion, a single sprint rarely has enough of them to be meaningful on its own.</p>
         </div>
         <div class="readme-section">
           <h3>Priority legend</h3>
